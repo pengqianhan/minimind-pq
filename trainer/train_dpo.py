@@ -185,7 +185,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int)
     parser.add_argument('--max_seq_len', default=1024, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
-    parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl")
+    parser.add_argument("--data_path", type=str, default="/mnt/DataSets/phan635/minimind/minimind_dataset/dpo.jsonl")
 
     args = parser.parse_args()
 
@@ -238,6 +238,8 @@ if __name__ == "__main__":
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     if ddp:
+        # 设置DDP分布式训练中需要忽略的参数和缓冲区
+        # pos_cis: 位置编码相关参数，通常是预计算的cos/sin值，不需要梯度更新和跨设备同步
         model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 

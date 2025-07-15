@@ -1,3 +1,109 @@
+"""
+MiniMind OpenAI-Compatible API Server
+
+This script provides an OpenAI-compatible API server for MiniMind language models, enabling
+seamless integration with existing tools and applications that use the OpenAI API format.
+The server supports both streaming and non-streaming chat completions.
+
+**Key Features:**
+- **OpenAI Compatibility**: Drop-in replacement for OpenAI API endpoints
+- **Streaming Support**: Real-time token streaming for responsive user experience
+- **Model Flexibility**: Support for different MiniMind model configurations and LoRA adapters
+- **Async Processing**: FastAPI-based asynchronous request handling
+- **Easy Integration**: Standard REST API with JSON request/response format
+
+**Supported Endpoints:**
+- `/v1/models`: List available models
+- `/v1/chat/completions`: Chat completion with streaming/non-streaming support
+
+**API Compatibility:**
+The server implements the OpenAI Chat Completions API format, making it compatible with:
+- OpenAI Python client library
+- LangChain and other LLM frameworks
+- Existing applications using OpenAI API
+- Command-line tools like curl
+
+**Request Format:**
+```json
+{
+  "model": "minimind",
+  "messages": [
+    {"role": "user", "content": "Hello, how are you?"}
+  ],
+  "stream": true,
+  "temperature": 0.7,
+  "max_tokens": 1000
+}
+```
+
+**Response Format (Non-streaming):**
+```json
+{
+  "id": "chatcmpl-123",
+  "object": "chat.completion",
+  "model": "minimind",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! I'm doing well, thank you for asking."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 15,
+    "total_tokens": 25
+  }
+}
+```
+
+**Streaming Response Format:**
+```
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","choices":[{"delta":{"content":"Hello"}}]}
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","choices":[{"delta":{"content":"!"}}]}
+data: [DONE]
+```
+
+**Usage Examples:**
+```bash
+# Start server
+python serve_openai_api.py --port 8000
+
+# Test with curl
+curl -X POST "http://localhost:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "minimind",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": false
+  }'
+
+# Test with OpenAI Python client
+import openai
+client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="dummy")
+response = client.chat.completions.create(
+    model="minimind",
+    messages=[{"role": "user", "content": "Hello"}]
+)
+```
+
+**Configuration:**
+- Model loading: Support for PyTorch checkpoints and HuggingFace format
+- LoRA adapters: Apply domain-specific fine-tuned weights
+- Generation parameters: Temperature, top_p, max_tokens control
+- Server settings: Port, host, and performance tuning options
+
+Dependencies:
+    - fastapi: Modern web framework for building APIs
+    - uvicorn: ASGI server for running FastAPI applications
+    - pydantic: Data validation and serialization
+    - torch: PyTorch for model inference
+    - transformers: HuggingFace model utilities
+"""
+
 import argparse
 import json
 import os
@@ -21,7 +127,12 @@ from model.model_lora import apply_lora, load_lora
 
 warnings.filterwarnings('ignore')
 
-app = FastAPI()
+# Initialize FastAPI application
+app = FastAPI(
+    title="MiniMind OpenAI-Compatible API",
+    description="OpenAI-compatible API server for MiniMind language models",
+    version="1.0.0"
+)
 
 
 def init_model(args):

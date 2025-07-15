@@ -1,3 +1,61 @@
+"""
+MiniMind Language Model Pre-training Script
+
+This script implements the pre-training stage for MiniMind language models using causal language modeling.
+Pre-training establishes the foundational language understanding capabilities through next-token prediction
+on large-scale text corpora.
+
+**Training Objective:**
+Learn fundamental language patterns, syntax, grammar, and world knowledge through unsupervised
+next-token prediction on diverse text data. This creates a strong foundation for downstream fine-tuning.
+
+**Key Features:**
+- **Distributed Training**: Multi-GPU support using PyTorch DistributedDataParallel (DDP)
+- **Memory Optimization**: Mixed precision training with autocast for efficient GPU utilization
+- **Dynamic Learning Rate**: Cosine annealing schedule for stable convergence
+- **Checkpointing**: Regular model saving with resume capability
+- **Monitoring**: Real-time loss tracking and logging
+
+**Training Pipeline:**
+1. **Data Loading**: Efficient batch loading with distributed sampling
+2. **Forward Pass**: Compute predictions and cross-entropy loss
+3. **Loss Masking**: Exclude padding tokens from loss computation
+4. **Backward Pass**: Gradient computation with automatic mixed precision
+5. **Optimization**: Parameter updates with learning rate scheduling
+6. **Checkpointing**: Periodic model state saving
+
+**Model Architecture Support:**
+- Standard Transformer architecture with RMSNorm and SwiGLU
+- Rotary Positional Embeddings (RoPE) for position encoding
+- Optional Mixture-of-Experts (MoE) for increased capacity
+- Configurable model sizes (26M, 104M, 145M parameters)
+
+**Performance Optimizations:**
+- Gradient accumulation for effective large batch training
+- Mixed precision training (FP16) for memory efficiency
+- Distributed data parallel for multi-GPU scaling
+- Efficient data loading with proper worker management
+
+**Usage:**
+    # Single GPU training
+    python train_pretrain.py --batch_size 32 --learning_rate 1e-4
+
+    # Multi-GPU training (4 GPUs)
+    torchrun --nproc_per_node=4 train_pretrain.py --batch_size 128
+
+**Arguments:**
+    --batch_size: Training batch size per GPU
+    --learning_rate: Initial learning rate for training
+    --epochs: Number of training epochs
+    --device: Training device (cuda/cpu)
+    --checkpoint_dir: Directory for saving model checkpoints
+
+Dependencies:
+    - torch: PyTorch deep learning framework
+    - transformers: HuggingFace model components
+    - torch.distributed: Multi-GPU training support
+"""
+
 import os
 import sys
 __package__ = "trainer"
@@ -21,15 +79,132 @@ warnings.filterwarnings('ignore')
 
 
 def Logger(content):
+    """
+    Distributed-aware logging function for multi-GPU training.
+
+    This function ensures that log messages are only printed once in distributed training
+    environments, preventing duplicate logging from multiple processes.
+
+    Args:
+        content (str): The message content to log. Can be any string including
+                      formatted training metrics, status updates, or debug information.
+
+    **Behavior:**
+    - Single GPU: Always prints the message
+    - Multi-GPU (DDP): Only prints from rank 0 process to avoid duplicates
+    - Rank 0: The master process responsible for logging and checkpointing
+
+    **Usage Examples:**
+    ```python
+    Logger("Training started")
+    Logger(f"Epoch {epoch}: Loss = {loss:.4f}")
+    Logger("Model checkpoint saved")
+    ```
+    """
     if not ddp or dist.get_rank() == 0:
         print(content)
 
 
 def get_lr(current_step, total_steps, lr):
+    """
+    Compute learning rate using cosine annealing schedule with warmup.
+
+    This function implements a learning rate schedule that starts with a warmup phase
+    followed by cosine annealing decay. This schedule helps with training stability
+    and convergence, especially for large language models.
+
+    **Schedule Components:**
+    1. **Warmup Phase**: Gradual increase from lr/10 to lr (improves stability)
+    2. **Cosine Decay**: Smooth decay following cosine curve (prevents sharp drops)
+
+    Args:
+        current_step (int): Current training step (0-based). Represents the global
+                           step count across all epochs and batches.
+        total_steps (int): Total number of training steps planned. Calculated as
+                          epochs × steps_per_epoch for the entire training run.
+        lr (float): Base learning rate value. The maximum learning rate reached
+                   after warmup and used as the starting point for cosine decay.
+
+    Returns:
+        float: Computed learning rate for the current step. Value ranges from
+               lr/10 (initial warmup) to near 0 (end of training).
+
+    **Mathematical Formula:**
+    ```
+    lr_current = lr/10 + 0.5 * lr * (1 + cos(π * current_step / total_steps))
+    ```
+
+    **Learning Rate Curve:**
+    - Step 0: lr/10 (warmup start)
+    - Step total_steps/4: ~lr (peak after warmup)
+    - Step total_steps/2: ~lr/2 (midpoint decay)
+    - Step total_steps: ~lr/10 (final decay)
+
+    **Benefits:**
+    - Gradual warmup prevents early training instability
+    - Smooth cosine decay avoids sharp learning rate drops
+    - Well-suited for transformer model training
+    - Helps achieve better final convergence
+    """
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
 def train_epoch(epoch, wandb):
+    """
+    Execute one complete training epoch with comprehensive monitoring.
+
+    This function performs forward and backward passes for all training batches in an epoch,
+    applying loss masking, gradient updates, and learning rate scheduling. It includes
+    detailed logging and performance monitoring for training analysis.
+
+    Args:
+        epoch (int): Current epoch number (0-based). Used for learning rate scheduling
+                    and logging context.
+        wandb: Weights & Biases logging object for experiment tracking. Can be None
+               if logging is disabled. Used to log metrics like loss, learning rate,
+               and training speed.
+
+    **Training Loop Process:**
+    1. **Batch Processing**: Iterate through all training batches
+    2. **Data Transfer**: Move input tensors to appropriate device (GPU/CPU)
+    3. **LR Scheduling**: Compute and apply current learning rate
+    4. **Forward Pass**: Model prediction with mixed precision
+    5. **Loss Computation**: Masked cross-entropy loss calculation
+    6. **Backward Pass**: Gradient computation and parameter updates
+    7. **Monitoring**: Track and log training metrics
+
+    **Variables Documentation:**
+    - loss_fct (nn.CrossEntropyLoss): Cross-entropy loss function with reduction='none'
+                                     for per-token loss computation before masking
+    - start_time (float): Epoch start timestamp for duration measurement
+    - X (torch.Tensor): Input token sequences, shape (batch_size, seq_len-1)
+    - Y (torch.Tensor): Target token sequences, shape (batch_size, seq_len-1)
+    - loss_mask (torch.Tensor): Binary mask for valid tokens, shape (batch_size, seq_len-1)
+    - lr (float): Current learning rate computed from schedule
+    - res (CausalLMOutputWithPast): Model output containing logits and auxiliary losses
+    - loss (torch.Tensor): Masked cross-entropy loss scalar for backpropagation
+
+    **Loss Masking Logic:**
+    ```python
+    # Compute per-token cross-entropy losses
+    token_losses = loss_fct(logits.view(-1, vocab_size), targets.view(-1))
+    # Reshape to match original sequence dimensions
+    token_losses = token_losses.view(batch_size, seq_len)
+    # Apply mask: only valid tokens contribute to loss
+    masked_loss = (token_losses * loss_mask).sum() / loss_mask.sum()
+    ```
+
+    **Memory Management:**
+    - Mixed precision training reduces GPU memory usage
+    - Gradient accumulation enables larger effective batch sizes
+    - Automatic memory cleanup after each batch
+
+    **Performance Monitoring:**
+    - Tracks tokens processed per second
+    - Monitors GPU memory utilization
+    - Logs loss convergence patterns
+    - Records learning rate progression
+    """
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(train_loader):

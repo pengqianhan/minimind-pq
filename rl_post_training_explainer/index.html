@@ -159,9 +159,30 @@ loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
             <!-- GRPO Content -->
             <div id="GRPO" class="tab-content">
                 <h3>Group Relative Policy Optimization (GRPO)</h3>
-                <p>GRPO 通过“分组相对价值估计”消除了 Critic 网络。它对同一个问题生成一组回答，以组内平均奖励作为 Baseline。</p>
+                <p>GRPO 由 <strong>DeepSeek</strong> 提出（见 DeepSeekMath），它通过“分组相对价值估计”消除了 Critic 网络，大大减少了显存占用和训练复杂度。</p>
+                <p>它对同一个问题生成一组回答 \( \{y_1, y_2, ..., y_G\} \)，计算这组回答的奖励 \( \{r_1, r_2, ..., r_G\}
+                    \)。然后使用组内标准化后的奖励作为优势（Advantage）：</p>
                 <div class="formula">
-                    $$ \mathcal{L}_{GRPO} = -\mathbb{E}\left[r_t \cdot A_t - \beta \cdot \text{KL}_t\right] $$
+                    $$ A_i = \frac{r_i - \text{mean}(\{r_1, ..., r_G\})}{\text{std}(\{r_1, ..., r_G\})} $$
+                </div>
+                <p>最终的优化目标为：</p>
+                <div class="formula">
+                    $$ \mathcal{L}_{GRPO} = -\mathbb{E}\left[ \frac{1}{G} \sum_{i=1}^G \left( \min \left(
+                    \frac{\pi_\theta(y_i|x)}{\pi_{old}(y_i|x)} A_i, \text{clip}(\dots) A_i \right) - \beta
+                    \text{KL}(\pi_\theta || \pi_{ref}) \right) \right] $$
+                </div>
+                <p><em>注：上式为简化示意，核心在于使用 \( A_i \) 替代了 PPO 中的 Advantage。</em></p>
+
+                <div class="references">
+                    <h4>参考资料</h4>
+                    <ul>
+                        <li><a href="https://arxiv.org/abs/2402.03300" target="_blank">DeepSeekMath: Pushing the Limits
+                                of Mathematical Reasoning in Open Language Models (Arxiv)</a></li>
+                        <li><a href="https://zhuanlan.zhihu.com/p/20021693569" target="_blank">GRPO: Group Relative
+                                Policy Optimization - 知乎</a></li>
+                        <li><a href="https://www.zhihu.com/question/10766825126" target="_blank">DeepSeek的GRPO算法是什么？ -
+                                知乎</a></li>
+                    </ul>
                 </div>
                 <div class="visualization">
                     <h4>训练曲线 (512 dim)</h4>

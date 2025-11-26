@@ -1,11 +1,11 @@
 import os
 import sys
+
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import argparse
 import time
-import math
 import warnings
 import torch
 import torch.nn.functional as F
@@ -14,55 +14,47 @@ from contextlib import nullcontext
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import DPODataset
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
 warnings.filterwarnings('ignore')
 
 
-def Logger(content):
-    if not ddp or dist.get_rank() == 0:
-        print(content)
-
-
-def get_lr(current_step, total_steps, lr):
-    return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
-
-
-def logits_to_probs(logits, labels):
+def logits_to_log_probs(logits, labels):
     # logits shape: (batch_size, seq_len, vocab_size)
     # labels shape: (batch_size, seq_len)
-    # probs shape: (batch_size, seq_len)
+    # log_probs shape: (batch_size, seq_len)
     log_probs = F.log_softmax(logits, dim=2)
-    probs = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
-    return probs
+    log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
+    return log_probs_per_token
 
 
-def dpo_loss(ref_probs, probs, mask, beta):
-    # ref_probs 和 probs 都是 shape: (batch_size, seq_len)
+def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
+    # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
     # https://github.com/jingyaogong/minimind/issues/298
-    seq_lengths = mask.sum(dim=1, keepdim=True)  # (batch_size, 1)
-    ref_probs = (ref_probs * mask).sum(dim=1) / seq_lengths.squeeze()
-    probs = (probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 防止零长度mask导致除零NaN
+    ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
 
     # 将 chosen 和 rejected 数据分开
-    batch_size = ref_probs.shape[0]
-    chosen_ref_probs = ref_probs[:batch_size // 2]
-    reject_ref_probs = ref_probs[batch_size // 2:]
-    chosen_probs = probs[:batch_size // 2]
-    reject_probs = probs[batch_size // 2:]
+    batch_size = ref_log_probs.shape[0]
+    chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
+    reject_ref_log_probs = ref_log_probs[batch_size // 2:]
+    chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
+    reject_policy_log_probs = policy_log_probs[batch_size // 2:]
 
-    pi_logratios = chosen_probs - reject_probs
-    ref_logratios = chosen_ref_probs - reject_ref_probs
+    pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
+    ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
     logits = pi_logratios - ref_logratios
     loss = -F.logsigmoid(beta * logits)
     return loss.mean()
 
 
-def train_epoch(epoch, wandb):
+def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
     start_time = time.time()
-    for step, batch in enumerate(train_loader):
+    
+    for step, batch in enumerate(loader, start=start_step + 1):
         x_chosen = batch['x_chosen'].to(args.device)
         x_rejected = batch['x_rejected'].to(args.device)
         y_chosen = batch['y_chosen'].to(args.device)
@@ -73,21 +65,21 @@ def train_epoch(epoch, wandb):
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
 
-        lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        with ctx:
+        with autocast_ctx:
             with torch.no_grad():
                 ref_outputs = ref_model(x)
                 ref_logits = ref_outputs.logits
-            ref_probs = logits_to_probs(ref_logits, y)
-            ref_probs = ref_probs * mask
+            ref_log_probs = logits_to_log_probs(ref_logits, y)
+            
             outputs = model(x)
             logits = outputs.logits
-            probs = logits_to_probs(logits, y)
-            probs = probs * mask
-            loss = dpo_loss(ref_probs, probs, mask, beta=0.1)
+            policy_log_probs = logits_to_log_probs(logits, y)
+            
+            loss = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -98,68 +90,30 @@ def train_epoch(epoch, wandb):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
 
-        if step % args.log_interval == 0:
+        if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
-            Logger(
-                'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.12f} epoch_Time:{}min:'.format(
-                    epoch + 1,
-                    args.epochs,
-                    step,
-                    iter_per_epoch,
-                    loss.item() * args.accumulation_steps,
-                    optimizer.param_groups[-1]['lr'],
-                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
+            current_loss = loss.item() * args.accumulation_steps
+            current_lr = optimizer.param_groups[-1]['lr']
+            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            
+            Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:')
+            
+            if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
 
-            if (wandb is not None) and (not ddp or dist.get_rank() == 0):
-                wandb.log({"loss": loss * args.accumulation_steps,
-                           "lr": optimizer.param_groups[-1]['lr'],
-                           "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
-
-        if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
+        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
-            moe_path = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/rlhf_{lm_config.hidden_size}{moe_path}.pth'
-
+            moe_suffix = '_moe' if lm_config.use_moe else ''
+            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
                 state_dict = model.state_dict()
             state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
             torch.save(state_dict, ckp)
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
-
-
-def init_model(lm_config):
-    tokenizer = AutoTokenizer.from_pretrained('../model/')
-    model = MiniMindForCausalLM(lm_config)
-    moe_path = '_moe' if lm_config.use_moe else ''
-    ckp = f'{args.save_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth'
-    state_dict = torch.load(ckp, map_location=args.device)
-    model.load_state_dict(state_dict, strict=False)
-    # 初始化参考模型
-    ref_model = MiniMindForCausalLM(lm_config)
-    ref_model.load_state_dict(state_dict, strict=False)
-    ref_model.eval()
-    ref_model.requires_grad_(False)
-
-    Logger(f'LLM总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
-    model = model.to(args.device)
-    ref_model = ref_model.to(args.device)
-
-    return model, ref_model, tokenizer
-
-
-def init_distributed_mode():
-    if not ddp: return
-    global ddp_local_rank, DEVICE
-
-    dist.init_process_group(backend="nccl")
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
-    ddp_world_size = int(os.environ["WORLD_SIZE"])
-    DEVICE = f"cuda:{ddp_local_rank}"
-    torch.cuda.set_device(DEVICE)
 
 
 if __name__ == "__main__":
@@ -185,61 +139,49 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int)
     parser.add_argument('--max_seq_len', default=1024, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
-    parser.add_argument("--data_path", type=str, default="/mnt/DataSets/phan635/minimind/minimind_dataset/dpo.jsonl")
+    parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl")
 
     args = parser.parse_args()
 
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
-    args.save_dir = os.path.join(args.out_dir)
+    # ========== 1. 初始化环境和随机种子 ==========
+    local_rank = init_distributed_mode()
+    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
+    
+    # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs(args.out_dir, exist_ok=True)
-    tokens_per_iter = args.batch_size * args.max_seq_len
+    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    
+    # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
-
-    args.wandb_run_name = f"MiniMind-Full-DPO-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-
-    ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
-    ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
-    ddp_local_rank, DEVICE = 0, "cuda:0"
-    base_seed = 1337
-    torch.manual_seed(base_seed)
-    torch.cuda.manual_seed(base_seed)
-
-    if ddp:
-        init_distributed_mode()
-        args.device = torch.device(DEVICE)
-        rank = dist.get_rank()
-        torch.manual_seed(base_seed + rank)
-        # 同时设置 CUDA 的随机种子
-        torch.cuda.manual_seed(base_seed + rank)
-
-    if args.use_wandb and (not ddp or ddp_local_rank == 0):
-        import wandb
-
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name)
-    else:
-        wandb = None
-
-    model, ref_model, tokenizer = init_model(lm_config)
-
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+    
+    # ========== 4. 配wandb ==========
+    wandb = None
+    if args.use_wandb and is_main_process():
+        import swanlab as wandb
+        wandb_id = ckp_data.get('wandb_id') if ckp_data else None
+        resume = 'must' if wandb_id else None
+        wandb_run_name = f"MiniMind-DPO-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
+        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
+    
+    # ========== 5. 定义模型和参考模型 ==========
+    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    Logger(f'策略模型总参数量：{sum(p.numel() for p in model.parameters()) / 1e6:.3f} M')
+    # 初始化参考模型（ref_model冻结）
+    ref_model, _ = init_model(lm_config, args.from_weight, device=args.device)
+    ref_model.eval()
+    ref_model.requires_grad_(False)
+    Logger(f'参考模型总参数量：{sum(p.numel() for p in ref_model.parameters()) / 1e6:.3f} M')
+    
     train_ds = DPODataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-    train_sampler = DistributedSampler(train_ds) if ddp else None
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        pin_memory=True,
-        drop_last=False,
-        shuffle=False,
-        num_workers=args.num_workers,
-        sampler=train_sampler
-    )
-
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
+    train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     if ddp:
-        # 设置DDP分布式训练中需要忽略的参数和缓冲区
-        # pos_cis: 位置编码相关参数，通常是预计算的cos/sin值，不需要梯度更新和跨设备同步
         model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 

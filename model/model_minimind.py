@@ -70,6 +70,7 @@ class MiniMindConfig(PretrainedConfig):
             vocab_size: int = 6400,
             rms_norm_eps: float = 1e-05,
             rope_theta: int = 1000000.0,
+            inference_rope_scaling: bool = False,
             flash_attn: bool = True,
             ####################################################
             # Here are the specific configurations of MOE
@@ -99,6 +100,15 @@ class MiniMindConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
+        self.inference_rope_scaling = inference_rope_scaling
+        # 外推长度 = factor * original_max_position_embeddings
+        self.rope_scaling = {
+            "beta_fast": 4,
+            "beta_slow": 1,
+            "factor": 4,
+            "original_max_position_embeddings": 2048,
+            "type": "yarn"
+        } if self.inference_rope_scaling else None
         self.flash_attn = flash_attn
         # -------------------------------------------------- #
         #       Mixture-of-Experts (MoE) Configuration       #
@@ -120,10 +130,11 @@ class MiniMindConfig(PretrainedConfig):
 
 import math
 import torch
+import torch.nn.init as init
+import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 from typing import Optional, Tuple, List, Union
-import torch.nn.functional as F
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -173,25 +184,6 @@ class RMSNorm(torch.nn.Module):
 
 
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
-    """
-    Precomputes the cosine and sine frequencies for Rotary Positional Embeddings (RoPE).
-
-    This function calculates the RoPE frequencies in advance, which can then be applied to
-    the query and key tensors in the attention mechanism.
-
-    Args:
-        dim (int): The dimension of the embeddings to which RoPE will be applied. This is
-                   typically the head dimension.
-        end (int, optional): The maximum sequence length for which to precompute frequencies.
-                             Defaults to 32768.
-        theta (float, optional): The base period for the sinusoidal embeddings.
-                                 Defaults to 1,000,000.0.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: A tuple containing two tensors:
-            - freqs_cos (torch.Tensor): Precomputed cosine values of shape (end, dim).
-            - freqs_sin (torch.Tensor): Precomputed sine values of shape (end, dim).
-    """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
@@ -257,9 +249,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return x
     return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
-        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+        x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
 
 
@@ -361,12 +351,10 @@ class Attention(nn.Module):
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
 
-        # Flash Attention path (optimized)
         if self.flash and seq_len != 1:
             dropout_p = self.dropout if self.training else 0.0
             attn_mask = None
             if attention_mask is not None:
-                # The mask needs to be broadcastable to the attention scores shape
                 attn_mask = attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1)
                 attn_mask = attn_mask.bool() if attention_mask is not None else None
 
@@ -474,7 +462,6 @@ class MoEGate(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Initializes the gating weights using Kaiming uniform initialization."""
         import torch.nn.init as init
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
@@ -785,12 +772,8 @@ class MiniMindModel(nn.Module):
         # Final layer normalization
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Precompute RoPE frequencies and register as buffers (not parameters)
-        freqs_cos, freqs_sin = precompute_freqs_cis(
-            dim=config.hidden_size // config.num_attention_heads,
-            end=config.max_position_embeddings, 
-            theta=config.rope_theta
-        )
+        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
+                                                    end=config.max_position_embeddings, theta=config.rope_theta)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
@@ -839,8 +822,6 @@ class MiniMindModel(nn.Module):
                                           Will be 0.0 if no MoE layers are used.
         """
         batch_size, seq_length = input_ids.shape
-        
-        # Initialize past key-values if not provided
         past_key_values = past_key_values or [None] * len(self.layers)
         
         # Determine starting position for RoPE (important for cached generation)

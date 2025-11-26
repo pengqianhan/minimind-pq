@@ -1,5 +1,12 @@
+<<<<<<< HEAD
 /model/__pycache__
 /dataset
 /out
 /MiniMind2-Small_full_sft
 /MiniMind2-Small_rlhf
+=======
+model/__pycache__
+out
+website/
+docs-minimind/
+>>>>>>> master

@@ -288,11 +288,7 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = self.load_data(jsonl_path)
-        
-        # Extract token IDs for loss mask generation
-        # bos_id (List[int]): Token sequence marking start of assistant response
         self.bos_id = tokenizer('<|im_start|>assistant', add_special_tokens=False).input_ids
-        # eos_id (List[int]): Token sequence marking end of conversation turn
         self.eos_id = tokenizer('<|im_end|>', add_special_tokens=False).input_ids
 
     def __len__(self):
@@ -328,42 +324,15 @@ class SFTDataset(Dataset):
         return samples
 
     def _create_chat_prompt(self, conversations):
-        """
-        Convert conversation turns into ChatML formatted prompt.
-
-        This method takes a list of conversation turns and formats them using the ChatML
-        template structure, automatically assigning user/assistant roles based on turn position.
-
-        Args:
-            conversations (List[Dict]): List of conversation turns, each containing 'content' field.
-                                      Format: [{"content": "user message"}, {"content": "assistant response"}]
-
-        Returns:
-            str: Formatted conversation string using ChatML template structure.
-                Contains properly formatted user and assistant turns with special tokens.
-
-        **Role Assignment Logic:**
-        - Even-indexed turns (0, 2, 4, ...): Assigned 'user' role
-        - Odd-indexed turns (1, 3, 5, ...): Assigned 'assistant' role
-
-        **Example:**
-        ```
-        Input: [{"content": "Hello"}, {"content": "Hi there!"}]
-        Output: "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi there!<|im_end|>"
-        ```
-        """
-        # messages (List[Dict[str, str]]): Structured conversation with explicit roles
+        """构建符合ChatML格式的对话"""
         messages = []
         for i, turn in enumerate(conversations):
-            # Alternate between user and assistant roles based on turn index
             role = 'user' if i % 2 == 0 else 'assistant'
             messages.append({"role": role, "content": turn['content']})
-        
-        # Apply ChatML template formatting
         return self.tokenizer.apply_chat_template(
             messages,
-            tokenize=False,                    # Return string, not token IDs
-            add_generation_prompt=False        # Don't add prompt for next response
+            tokenize=False,
+            add_generation_prompt=False
         )
 
     def _generate_loss_mask(self, input_ids):
@@ -473,13 +442,10 @@ class SFTDataset(Dataset):
         # loss_mask (List[int]): Binary mask indicating trainable positions
         loss_mask = self._generate_loss_mask(input_ids)
 
-        # Create autoregressive training pairs with aligned loss mask
-        # X: Input sequence (all tokens except last)
-        # Y: Target sequence (all tokens except first) 
-        # loss_mask: Aligned to target positions for proper masking
-        X = torch.tensor(input_ids[:-1], dtype=torch.long)          # Shape: (max_length-1,)
-        Y = torch.tensor(input_ids[1:], dtype=torch.long)           # Shape: (max_length-1,)
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)   # Shape: (max_length-1,)
+        # 构建训练数据
+        X = torch.tensor(input_ids[:-1], dtype=torch.long)
+        Y = torch.tensor(input_ids[1:], dtype=torch.long)
+        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # 对齐预测位置
 
         return X, Y, loss_mask
 
@@ -551,12 +517,8 @@ class DPODataset(Dataset):
         
         # Handle padding token (fallback to 0 if not defined)
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        
-        # Extract special token sequences for loss mask generation
         self.bos_id = tokenizer('<|im_start|>assistant', add_special_tokens=False).input_ids
         self.eos_id = tokenizer('<|im_end|>', add_special_tokens=False).input_ids
-        
-        # Load preference pair data
         with open(file_path, 'r', encoding='utf-8') as f:
             self.data = []
             for line in f:
@@ -776,8 +738,6 @@ class RLAIFDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = self.load_data(jsonl_path)
-        
-        # Extract special token sequences (same as SFT for consistency)
         self.bos_id = tokenizer('<|im_start|>assistant', add_special_tokens=False).input_ids
         self.eos_id = tokenizer('<|im_end|>', add_special_tokens=False).input_ids
 
@@ -862,16 +822,11 @@ class RLAIFDataset(Dataset):
             messages.append({"role": role, "content": turn['content']})
             # Capture the last assistant response as the target answer
             answer = turn['content']
-        
-        # Create prompt from conversation context excluding the final assistant response
-        # This provides the context for completion generation
-        prompt = self.tokenizer.apply_chat_template(
-            messages[:-1],                     # Exclude the final assistant response
-            tokenize=False,                    # Return string format
-            add_generation_prompt=True         # Add prompt for completion generation
-        )
-        
-        return prompt, answer
+        return self.tokenizer.apply_chat_template(
+            messages[:-1],
+            tokenize=False,
+            add_generation_prompt=True
+        ), answer
 
     def __getitem__(self, index):
         """

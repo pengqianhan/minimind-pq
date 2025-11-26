@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MiniMind - 强化学习后训练 (RL Post-training)</title>
+    <link rel="stylesheet" href="styles.css">
+    <!-- MathJax for LaTeX rendering -->
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <!-- Prism.js for syntax highlighting -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>MiniMind - 强化学习后训练详解</h1>
+            <p>深入理解 RLHF 与 RLAIF：从直觉到代码实现</p>
+        </div>
+    </header>
+
+    <main class="container">
+        <section id="intro">
+            <h2>1. 简介</h2>
+            <p>在 LLM 的训练过程中，强化学习后训练（Post-training）是至关重要的一步。它让模型从单纯的“词语接龙”学会如何更好地符合人类的价值观和偏好。</p>
+            <div class="comparison-card">
+                <h3>RLHF vs RLAIF</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>类型</th>
+                            <th>全称</th>
+                            <th>裁判</th>
+                            <th>优点</th>
+                            <th>缺点</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>RLHF</strong></td>
+                            <td>Reinforcement Learning from Human Feedback</td>
+                            <td>人类</td>
+                            <td>更贴近真实人类偏好</td>
+                            <td>成本高、效率低</td>
+                        </tr>
+                        <tr>
+                            <td><strong>RLAIF</strong></td>
+                            <td>Reinforcement Learning from AI Feedback</td>
+                            <td>AI模型 / 规则</td>
+                            <td>自动化、可扩展性强</td>
+                            <td>可能偏离人类真实偏好</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p>二者本质上是一样的，都是通过<strong>强化学习的方式</strong>，利用某种形式的“<strong>反馈</strong>”来优化模型的行为。</p>
+            </div>
+        </section>
+
+        <section id="unified-view">
+            <h2>2. PO 算法的统一视角</h2>
+            <p>所有 Policy Optimization (PO) 算法的本质都只是在优化一个期望：</p>
+            <div class="formula">
+                $$ \mathcal{J}_{PO} = \mathbb{E}_{q \sim P(Q), o \sim \pi(O|q)} \left[ \underbrace{f(r_t)}_{\text{策略项}} \cdot \underbrace{g(A_t)}_{\text{优势项}} - \underbrace{h(\text{KL}_t)}_{\text{正则项}} \right] $$
+            </div>
+            <p>训练时，只需<strong>最小化负目标函数</strong>，即: \( \mathcal{L_{PO}}=-\mathcal{J_{PO}} \)</p>
+            <ul>
+                <li><strong>策略项</strong> \( f(r_t) \): 如何使用概率比 \( r_t \)? 衡量新旧策略偏差。</li>
+                <li><strong>优势项</strong> \( g(A_t) \): 如何计算优势 \( A_t \)? 衡量动作的好坏。</li>
+                <li><strong>正则项</strong> \( h(\text{KL}_t) \): 如何约束变化幅度 \( \text{KL}_t \)? 防止策略跑偏。</li>
+            </ul>
+        </section>
+
+        <section id="algorithms">
+            <h2>3. 算法详解</h2>
+            
+            <div class="tabs">
+                <button class="tab-btn active" onclick="openTab(event, 'DPO')">DPO</button>
+                <button class="tab-btn" onclick="openTab(event, 'PPO')">PPO</button>
+                <button class="tab-btn" onclick="openTab(event, 'GRPO')">GRPO</button>
+                <button class="tab-btn" onclick="openTab(event, 'SPO')">SPO</button>
+            </div>
+
+            <!-- DPO Content -->
+            <div id="DPO" class="tab-content" style="display: block;">
+                <h3>Direct Preference Optimization (DPO)</h3>
+                <p>DPO 直接优化偏好对的对数似然，无需显式的 Reward Model。它通过最大化“chosen 优于 rejected”的对数几率来训练。</p>
+                <div class="formula">
+                    $$ \mathcal{L}_{DPO} = -\mathbb{E}\left[\log \sigma\left(\beta \left[\log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\right]\right)\right] $$
+                </div>
+                <div class="code-block">
+                    <h4>核心代码实现 (train_dpo.py)</h4>
+                    <pre><code class="language-python">
+def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
+    # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
+    seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+
+    # 将 chosen 和 rejected 数据分开
+    batch_size = ref_log_probs.shape[0]
+    chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
+    reject_ref_log_probs = ref_log_probs[batch_size // 2:]
+    chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
+    reject_policy_log_probs = policy_log_probs[batch_size // 2:]
+
+    pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
+    ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
+    logits = pi_logratios - ref_logratios
+    loss = -F.logsigmoid(beta * logits)
+    return loss.mean()
+                    </code></pre>
+                </div>
+            </div>
+
+            <!-- PPO Content -->
+            <div id="PPO" class="tab-content">
+                <h3>Proximal Policy Optimization (PPO)</h3>
+                <p>PPO 是经典的 On-Policy 算法，使用 Actor-Critic 架构。它通过裁剪概率比来防止策略更新过激。</p>
+                <div class="formula">
+                    $$ \mathcal{L}_{PPO} = -\mathbb{E}\left[\min(r_t \cdot A_t, \text{clip}(r_t, 1-\varepsilon, 1+\varepsilon) \cdot A_t)\right] + \beta \cdot \mathbb{E}[\text{KL}] $$
+                </div>
+                <div class="visualization">
+                    <h4>训练曲线 (512 dim)</h4>
+                    <img src="../images/train_ppo_512.png" alt="PPO Training Curve 512dim">
+                </div>
+                <div class="code-block">
+                    <h4>核心代码实现 (train_ppo.py)</h4>
+                    <pre><code class="language-python">
+# 计算概率比 ratio
+ratio = torch.exp(actor_logp - old_logp)  # [B]
+# 计算 surrogate loss
+surr1 = ratio * advantages  # [B]
+surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages  # [B]
+policy_loss = -torch.min(surr1, surr2).mean()  # scalar
+# 计算 value loss
+value_loss = F.mse_loss(values, rewards)  # scalar
+# 总 loss
+loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
+                    </code></pre>
+                </div>
+            </div>
+
+            <!-- GRPO Content -->
+            <div id="GRPO" class="tab-content">
+                <h3>Group Relative Policy Optimization (GRPO)</h3>
+                <p>GRPO 通过“分组相对价值估计”消除了 Critic 网络。它对同一个问题生成一组回答，以组内平均奖励作为 Baseline。</p>
+                <div class="formula">
+                    $$ \mathcal{L}_{GRPO} = -\mathbb{E}\left[r_t \cdot A_t - \beta \cdot \text{KL}_t\right] $$
+                </div>
+                 <div class="visualization">
+                    <h4>训练曲线 (512 dim)</h4>
+                    <img src="../images/train_grpo_512.png" alt="GRPO Training Curve 512dim">
+                </div>
+                <div class="code-block">
+                    <h4>核心代码实现 (train_grpo.py)</h4>
+                    <pre><code class="language-python">
+# 组内归一化计算优势
+grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
+mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)
+std_r = grouped_rewards.std(dim=1).repeat_interleave(args.num_generations)
+advantages = torch.clamp((rewards - mean_r) / (std_r + 1e-4), -10, 10)
+advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+# 计算 Loss
+per_token_loss = -(torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1) - args.beta * per_token_kl)
+loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+                    </code></pre>
+                </div>
+            </div>
+
+            <!-- SPO Content -->
+            <div id="SPO" class="tab-content">
+                <h3>Single-stream Policy Optimization (SPO)</h3>
+                <p>SPO 旨在解决 GRPO 的“退化组”问题。它使用自适应的 Value Tracker 来提供跨 Batch 的稳定 Baseline，无需分组采样。</p>
+                <div class="formula">
+                    $$ \mathcal{L}_{SPO} = -\mathbb{E}\left[\log \pi_\theta(a_t|s) \cdot A_t - \beta \cdot \text{KL}_t\right] $$
+                </div>
+                <div class="visualization">
+                    <h4>训练曲线 (768 dim)</h4>
+                    <img src="../images/train_spo_768.png" alt="SPO Training Curve 768dim">
+                </div>
+                <div class="code-block">
+                    <h4>核心代码实现 (train_spo.py)</h4>
+                    <pre><code class="language-python">
+# 自适应 Baseline
+baselines = value_tracker.get_baselines(len(prompts)).to(args.device)
+# 计算优势
+advantages = rewards - unnormalized_baselines
+advantages = advantages.clamp(-5.0, 5.0)
+
+# 计算 Loss
+per_token_loss = -per_token_logps * advantages.unsqueeze(1) + args.beta * per_token_kl
+loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+# 更新 Value Tracker
+rho = value_tracker.update(rewards, per_token_logps.detach(), response_masks)
+                    </code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="summary">
+            <h2>4. 算法总结</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>算法</th>
+                        <th>策略项 \( f(r_t) \)</th>
+                        <th>优势项 \( g(A_t) \)</th>
+                        <th>正则项 \( h(\text{KL}_t) \)</th>
+                        <th>优化模型数</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>DPO</strong></td>
+                        <td>\( \log r_w - \log r_l \)</td>
+                        <td>隐式（偏好对比）</td>
+                        <td>隐含在 \( \beta \) 中</td>
+                        <td>2</td>
+                    </tr>
+                    <tr>
+                        <td><strong>PPO</strong></td>
+                        <td>\( \min(r, \text{clip}(r)) \)</td>
+                        <td>\( R - V(s) \)</td>
+                        <td>\( \beta \cdot \mathbb{E}[\text{KL}] \)</td>
+                        <td>4</td>
+                    </tr>
+                    <tr>
+                        <td><strong>GRPO</strong></td>
+                        <td>\( r \)</td>
+                        <td>\( \frac{R - \mu}{\sigma} \)</td>
+                        <td>\( \beta \cdot \text{KL}_t \)</td>
+                        <td>2</td>
+                    </tr>
+                    <tr>
+                        <td><strong>SPO</strong></td>
+                        <td>\( \log \pi_\theta \)</td>
+                        <td>\( R - B_t^{adaptive} \)</td>
+                        <td>\( \beta \cdot \text{KL}_t \)</td>
+                        <td>2</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2025 MiniMind Project. Based on <a href="https://github.com/jingyaogong/minimind">MiniMind</a>.</p>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>

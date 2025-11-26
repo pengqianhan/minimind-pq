@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -13,6 +14,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
 </head>
+
 <body>
     <header>
         <div class="container">
@@ -62,7 +64,8 @@
             <h2>2. PO 算法的统一视角</h2>
             <p>所有 Policy Optimization (PO) 算法的本质都只是在优化一个期望：</p>
             <div class="formula">
-                $$ \mathcal{J}_{PO} = \mathbb{E}_{q \sim P(Q), o \sim \pi(O|q)} \left[ \underbrace{f(r_t)}_{\text{策略项}} \cdot \underbrace{g(A_t)}_{\text{优势项}} - \underbrace{h(\text{KL}_t)}_{\text{正则项}} \right] $$
+                $$ \mathcal{J}_{PO} = \mathbb{E}_{q \sim P(Q), o \sim \pi(O|q)} \left[ \underbrace{f(r_t)}_{\text{策略项}}
+                \cdot \underbrace{g(A_t)}_{\text{优势项}} - \underbrace{h(\text{KL}_t)}_{\text{正则项}} \right] $$
             </div>
             <p>训练时，只需<strong>最小化负目标函数</strong>，即: \( \mathcal{L_{PO}}=-\mathcal{J_{PO}} \)</p>
             <ul>
@@ -74,7 +77,7 @@
 
         <section id="algorithms">
             <h2>3. 算法详解</h2>
-            
+
             <div class="tabs">
                 <button class="tab-btn active" onclick="openTab(event, 'DPO')">DPO</button>
                 <button class="tab-btn" onclick="openTab(event, 'PPO')">PPO</button>
@@ -87,8 +90,18 @@
                 <h3>Direct Preference Optimization (DPO)</h3>
                 <p>DPO 直接优化偏好对的对数似然，无需显式的 Reward Model。它通过最大化“chosen 优于 rejected”的对数几率来训练。</p>
                 <div class="formula">
-                    $$ \mathcal{L}_{DPO} = -\mathbb{E}\left[\log \sigma\left(\beta \left[\log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\right]\right)\right] $$
+                    $$ \mathcal{L}_{DPO} = -\mathbb{E}\left[\log \sigma\left(\beta \left[\log
+                    \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \log
+                    \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\right]\right)\right] $$
                 </div>
+                <p><strong>直观理解：</strong> DPO 本质上是在优化策略模型与参考模型之间的<strong>相对对数概率差</strong>。我们希望对于“好”的回答 \( y_w
+                    \)，策略模型比参考模型给出的概率更高；而对于“坏”的回答 \( y_l \)，策略模型给出的概率更低。</p>
+                <div class="formula">
+                    $$ \text{Gap} = \underbrace{\log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)}}_{\text{奖励好回答}} -
+                    \underbrace{\log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}}_{\text{惩罚坏回答}} $$
+                </div>
+                <p>参考资料：<a href="https://zhuanlan.zhihu.com/p/642569664" target="_blank">DPO: Direct Preference
+                        Optimization 论文解读及代码实践 - 知乎</a></p>
                 <div class="code-block">
                     <h4>核心代码实现 (train_dpo.py)</h4>
                     <pre><code class="language-python">
@@ -119,7 +132,8 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
                 <h3>Proximal Policy Optimization (PPO)</h3>
                 <p>PPO 是经典的 On-Policy 算法，使用 Actor-Critic 架构。它通过裁剪概率比来防止策略更新过激。</p>
                 <div class="formula">
-                    $$ \mathcal{L}_{PPO} = -\mathbb{E}\left[\min(r_t \cdot A_t, \text{clip}(r_t, 1-\varepsilon, 1+\varepsilon) \cdot A_t)\right] + \beta \cdot \mathbb{E}[\text{KL}] $$
+                    $$ \mathcal{L}_{PPO} = -\mathbb{E}\left[\min(r_t \cdot A_t, \text{clip}(r_t, 1-\varepsilon,
+                    1+\varepsilon) \cdot A_t)\right] + \beta \cdot \mathbb{E}[\text{KL}] $$
                 </div>
                 <div class="visualization">
                     <h4>训练曲线 (512 dim)</h4>
@@ -149,7 +163,7 @@ loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
                 <div class="formula">
                     $$ \mathcal{L}_{GRPO} = -\mathbb{E}\left[r_t \cdot A_t - \beta \cdot \text{KL}_t\right] $$
                 </div>
-                 <div class="visualization">
+                <div class="visualization">
                     <h4>训练曲线 (512 dim)</h4>
                     <img src="../images/train_grpo_512.png" alt="GRPO Training Curve 512dim">
                 </div>
@@ -175,7 +189,8 @@ loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=
                 <h3>Single-stream Policy Optimization (SPO)</h3>
                 <p>SPO 旨在解决 GRPO 的“退化组”问题。它使用自适应的 Value Tracker 来提供跨 Batch 的稳定 Baseline，无需分组采样。</p>
                 <div class="formula">
-                    $$ \mathcal{L}_{SPO} = -\mathbb{E}\left[\log \pi_\theta(a_t|s) \cdot A_t - \beta \cdot \text{KL}_t\right] $$
+                    $$ \mathcal{L}_{SPO} = -\mathbb{E}\left[\log \pi_\theta(a_t|s) \cdot A_t - \beta \cdot
+                    \text{KL}_t\right] $$
                 </div>
                 <div class="visualization">
                     <h4>训练曲线 (768 dim)</h4>
@@ -249,10 +264,12 @@ rho = value_tracker.update(rewards, per_token_logps.detach(), response_masks)
 
     <footer>
         <div class="container">
-            <p>&copy; 2025 MiniMind Project. Based on <a href="https://github.com/jingyaogong/minimind">MiniMind</a>.</p>
+            <p>&copy; 2025 MiniMind Project. Based on <a href="https://github.com/jingyaogong/minimind">MiniMind</a>.
+            </p>
         </div>
     </footer>
 
     <script src="script.js"></script>
 </body>
+
 </html>

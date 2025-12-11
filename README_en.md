@@ -1193,7 +1193,7 @@ In early 2025, DeepSeek-R1 became extremely popular, and equally popular was the
 $$\mathcal{L}_{GRPO} = -\mathbb{E}\left[r_t \cdot A_t - \beta \cdot \text{KL}_t\right]$$
 
 Where:
-- **Policy term**: $f(r_t) = r_t$ (directly use probability ratio, no clip clipping)
+- **Policy term**: $f(r_t) = \min(r_t, \text{clip}(r_t))$ (use probability ratio with clip clipping)
 - **Advantage term**: $g(A_t) = \frac{R - \mu_{group}}{\sigma_{group}}$ (within-group normalization, eliminate Critic network)
 - **Regularization term**: $h(\text{KL}_t) = \beta \cdot \text{KL}_t$ (token-level KL divergence constraint)
 
@@ -1271,7 +1271,7 @@ We return to the "**unified framework**", reorganizing the table showing all dif
 |-----------|----------------|----------------|----------------------|----------|
 | **DPO** | $\log r_w - \log r_l$ | Implicit (preference contrast) | Implicit in $\beta$ | 2 |
 | **PPO** | $\min(r, \text{clip}(r))$ | $R - V(s)$ | $\beta \cdot \mathbb{E}[\text{KL}]$ | 4 |
-| **GRPO** | $r$ | $\frac{R - \mu}{\sigma}$ | $\beta \cdot \text{KL}_t$ | 2 |
+| **GRPO** | $\min(r, \text{clip}(r))$ | $\frac{R - \mu}{\sigma}$ | $\beta \cdot \text{KL}_t$ | 2 |
 | **SPO** | $\log \pi_\theta$ | $R - B_t^{adaptive}$ | $\beta \cdot \text{KL}_t$ | 2 |
 
 **RL is Elegant and Self-Consistent**
@@ -1547,13 +1547,32 @@ Personal subjective evaluation basically aligns with DeepSeek-R1, where:
 ## Ⅳ RoPE Long-text Extrapolation
 
 MiniMind supports RoPE position encoding length extrapolation through YaRN algorithm, enabling models to handle text sequences exceeding training length.
-When using `eval_llm.py` for inference, just add `--inference_rope_scaling` parameter to enable RoPE extrapolation:
+
+For native torch models, when using `eval_llm.py` for inference, just add `--inference_rope_scaling` parameter to enable RoPE extrapolation:
 
 ```bash
 python eval_llm.py --weight full_sft --inference_rope_scaling
 ```
 
-The chart below shows perplexity (PPL) comparison before and after RoPE scaling on different lengths of "Journey to the West" vernacular fiction text. You can see that after enabling RoPE scaling, model performance on long texts is significantly improved.
+For Transformers format models, add the following configuration to config.json to enable length extrapolation:
+
+```json
+"rope_scaling": {
+    "type": "yarn",
+    "factor": 16.0,
+    "original_max_position_embeddings": 2048,
+    "beta_fast": 32.0,
+    "beta_slow": 1.0,
+    "attention_factor": 1.0
+}
+```
+
+Testing on MiniMind-Small model with different lengths of "Journey to the West" vernacular fiction text to evaluate perplexity (PPL) comparison before and after RoPE scaling.
+You can see that after enabling YaRN extrapolation, the model's PPL performance on long texts significantly decreases:
+
+<div align="center">
+<img src="./images/rope_ppl.png">
+</div>
 
 ## Ⅴ Objective Benchmarks
 
